@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: ""
+
+Parameters:
+  BucketToStoreResult:
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: "Result of S3 bucket policy addition/deletion will be stored in this bucket in csv format."
+    Type: String
+
+  StatementID:
+    Default: "ForceS3IntelligentTiering20230820"
+    Description: "This string is set as Sid in S3 bucket policy, and used as a marker for deletion."
+    Type: String
+
+Resources:
+  #==================================================
+  # Managed IAM policies
+  #==================================================
+  PolicyToAddS3BucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetBucketPolicy"
+              - "s3:ListAllMyBuckets"
+              - "s3:PutBucketPolicy"
+            Resource: "arn:aws:s3:::*"
+
+  PolicyToDeleteS3BucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:DeleteBucketPolicy"
+              - "s3:GetBucketPolicy"
+              - "s3:ListAllMyBuckets"
+            Resource: "arn:aws:s3:::*"
+
+  PolicyToStoreResult:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref BucketToStoreResult, '/*']]
+
+  #==================================================
+  # IAM roles
+  #==================================================
+  ResourceOfRoleToAddS3BucketPolicy:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref PolicyToAddS3BucketPolicy
+        - !Ref PolicyToStoreResult
+
+  ResourceOfRoleToDeleteS3BucketPolicy:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref PolicyToDeleteS3BucketPolicy
+        - !Ref PolicyToStoreResult
+          
+  #==================================================
+  # Lambda functions
+  #==================================================
+  FunctionToAddS3BucketPolicy:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import logging
+          import os
+          
+          from datetime import datetime
+          from time import strftime 
+          
+          BUCKET_TO_STORE_RESULT = os.environ['BUCKET_TO_STORE_RESULT']
+          STATEMENT_ID = os.environ['STATEMENT_ID']
+          
+          def get_account_id():
+              client = boto3.client('sts')
+              caller_identity = client.get_caller_identity()
+              # logging.info("caller_identity = {}".format(caller_identity))
+              account_id = caller_identity['Account']
+              return(account_id)
+          
+          def get_s3_bucket_policy(_arg_s3_bucket_name):
+              # logging.info("_arg_s3_bucket_name = {}".format(_arg_s3_bucket_name))
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_policy(Bucket=_arg_s3_bucket_name)
+                  # logging.info("response = {}".format(response))
+                  bucket_policy = response['Policy']
+                  # logging.info("bucket_policy = {}".format(bucket_policy))
+              # Following exception returns when bucket policy is not set to the S3 bucket.
+              # "An error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation: The bucket policy does not exist"
+              except botocore.exceptions.ClientError as e:
+                  logging.info(type(e))
+                  logging.info(e)
+                  bucket_policy = None
+              return bucket_policy
+          
+          def list_s3_buckets():
+              client = boto3.client('s3')
+              buckets = client.list_buckets()
+              # logging.info("buckets = {}".format(buckets))
+              bucket_list = list()
+              for _i_bucket in buckets['Buckets']:
+                  bucket_name = _i_bucket['Name']
+                  # logging.info("bucket_name = {}".format(bucket_name))
+                  bucket_list.append(bucket_name)
+              return bucket_list
+          
+          def put_s3_bucket_policy(_arg_s3_bucket_name):
+              # logging.info("_arg_s3_bucket_name = {}".format(_arg_s3_bucket_name))
+              client = boto3.client('s3')
+              policy = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Sid": STATEMENT_ID,
+                          "Effect": "Deny",
+                          "Principal": {
+                              "AWS": "*"
+                          },
+                          "Action": "s3:PutObject",
+                          "Resource": "arn:aws:s3:::{}/*".format(_arg_s3_bucket_name),
+                          "Condition": {
+                              "StringNotEquals": {
+                                  "s3:x-amz-storage-class": ["INTELLIGENT_TIERING"]
+                              }
+                          }
+                      }
+                  ]
+              }
+              policy_str = json.dumps(policy)
+              # logging.info("policy_str = {}".format(policy_str))
+              try:
+                  client.put_bucket_policy(Bucket=_arg_s3_bucket_name, Policy=policy_str)
+              except Exception as e:
+                  logging.info(type(e))
+                  logging.info(e)
+          
+          def lambda_handler(event, context):
+              logging.getLogger().setLevel(logging.INFO)
+          
+              account_id = get_account_id()
+              logging.info("account_id = {}".format(account_id))
+          
+              bucket_list = list_s3_buckets()
+              logging.info("bucket_list = {}".format(bucket_list))
+          
+              result_csv = 'account_id,bucket_name,status'
+          
+              # Check whether bucket policy is already set to each S3 bucket.
+              # If there is a bucket policy, do nothing.
+              # If there is no bucket policy set to the bucket, then set new policy to force S3 Intelligent Tiering.
+              for _i_bucket in bucket_list:
+                  logging.info("_i_bucket = {}".format(_i_bucket))
+                  bucket_policy = get_s3_bucket_policy(_i_bucket)
+                  logging.info("bucket_policy = {}".format(bucket_policy))
+                  # bucket_policy = None means there is no bucket policy set.
+                  if bucket_policy is None:
+                      put_s3_bucket_policy(_i_bucket)
+                      result = "{},{},{}".format(account_id, _i_bucket, 'Added a new S3 Bucket Policy')
+                  # If bucket_policy is not None, bucket policy is already set.
+                  else:
+                      result = "{},{},{}".format(account_id, _i_bucket, 'No changes made to S3 Bucket Policy')
+                  result_csv = result_csv + '\n' + result
+          
+              logging.info("result_csv = {}".format(result_csv))
+          
+              client = boto3.client('s3')
+              now = datetime.now()
+              current_time = now.strftime("%Y-%m-%d-%H:%M:%S")
+              client.put_object(
+                  Body = result_csv,
+                  Bucket = BUCKET_TO_STORE_RESULT,
+                  Key = "s3_bucket_policy_modification_result_{}.csv".format(current_time),
+                  StorageClass = 'INTELLIGENT_TIERING'
+              )
+      Environment:
+        Variables:
+          BUCKET_TO_STORE_RESULT: !Ref BucketToStoreResult
+          STATEMENT_ID: !Ref StatementID
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfRoleToAddS3BucketPolicy.Arn
+      Runtime: python3.11
+      Timeout: 900
+
+  FunctionToDeleteS3BucketPolicy:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import logging
+          import os
+          
+          from datetime import datetime
+          from time import strftime 
+          
+          BUCKET_TO_STORE_RESULT = os.environ['BUCKET_TO_STORE_RESULT']
+          STATEMENT_ID = os.environ['STATEMENT_ID']
+          
+          MESSAGE_DID_NOTHING = 'No changes made to S3 Bucket Policy'
+          MESSAGE_DELETED_BUCKET_POLICY = 'Deleted S3 Bucket Policy'
+          
+          def delete_s3_delete_bucket_policy(_arg_s3_bucket_name, _arg_s3_bucket_policy):
+              bucket_policy_dict = json.loads(_arg_s3_bucket_policy)
+              # logging.info("bucket_policy_dict = {}".format(bucket_policy_dict))
+              statement = bucket_policy_dict.get('Statement')
+              if statement is None:
+                  return MESSAGE_DID_NOTHING
+              sid = statement[0].get('Sid')
+              # logging.info("sid = {}".format(sid))
+              if sid is None:
+                  return MESSAGE_DID_NOTHING
+              if sid == STATEMENT_ID:
+                  logging.info('Delete S3 Bucket Policy.')
+                  client = boto3.client('s3')
+                  response = client.delete_bucket_policy(Bucket=_arg_s3_bucket_name)
+                  message = MESSAGE_DELETED_BUCKET_POLICY
+              else:
+                  message = MESSAGE_DID_NOTHING
+              return message
+          
+          def get_account_id():
+              client = boto3.client('sts')
+              caller_identity = client.get_caller_identity()
+              # logging.info("caller_identity = {}".format(caller_identity))
+              account_id = caller_identity['Account']
+              return(account_id)
+          
+          def get_s3_bucket_policy(_arg_s3_bucket_name):
+              # logging.info("_arg_s3_bucket_name = {}".format(_arg_s3_bucket_name))
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_policy(Bucket=_arg_s3_bucket_name)
+                  # logging.info("response = {}".format(response))
+                  bucket_policy = response['Policy']
+                  # logging.info("bucket_policy = {}".format(bucket_policy))
+              # Following exception returns when bucket policy is not set to the S3 bucket.
+              # "An error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation: The bucket policy does not exist"
+              except botocore.exceptions.ClientError as e:
+                  logging.info(type(e))
+                  logging.info(e)
+                  bucket_policy = None
+              return bucket_policy
+          
+          def list_s3_buckets():
+              client = boto3.client('s3')
+              buckets = client.list_buckets()
+              # logging.info("buckets = {}".format(buckets))
+              bucket_list = list()
+              for _i_bucket in buckets['Buckets']:
+                  bucket_name = _i_bucket['Name']
+                  # logging.info("bucket_name = {}".format(bucket_name))
+                  bucket_list.append(bucket_name)
+              return bucket_list
+          
+          def lambda_handler(event, context):
+              logging.getLogger().setLevel(logging.INFO)
+          
+              account_id = get_account_id()
+              logging.info("account_id = {}".format(account_id))
+          
+              bucket_list = list_s3_buckets()
+              logging.info("bucket_list = {}".format(bucket_list))
+          
+              result_csv = 'account_id,bucket_name,status'
+          
+              for _i_bucket in bucket_list:
+                  logging.info("_i_bucket = {}".format(_i_bucket))
+                  bucket_policy = get_s3_bucket_policy(_i_bucket)
+                  logging.info("bucket_policy = {}".format(bucket_policy))
+                  # bucket_policy = None means there is no bucket policy set.
+                  if bucket_policy is None:
+                      result = "{},{},{}".format(account_id, _i_bucket, MESSAGE_DID_NOTHING)
+                  else:
+                      new_status = delete_s3_delete_bucket_policy(_i_bucket, bucket_policy)
+                      result = "{},{},{}".format(account_id, _i_bucket, new_status)
+                  result_csv = result_csv + '\n' + result
+          
+              logging.info("result_csv = {}".format(result_csv))
+          
+              client = boto3.client('s3')
+              now = datetime.now()
+              current_time = now.strftime("%Y-%m-%d-%H:%M:%S")
+              client.put_object(
+                  Body = result_csv,
+                  Bucket = BUCKET_TO_STORE_RESULT,
+                  Key = "s3_bucket_policy_deletion_result_{}.csv".format(current_time),
+                  StorageClass = 'INTELLIGENT_TIERING'
+              )
+      Environment:
+        Variables:
+          BUCKET_TO_STORE_RESULT: !Ref BucketToStoreResult
+          STATEMENT_ID: !Ref StatementID
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfRoleToDeleteS3BucketPolicy.Arn
+      Runtime: python3.11
+      Timeout: 900
+
+  #==================================================
+  # EventBridge rule
+  #==================================================
+  ScheduledRuleToAddS3BucketPolicy:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'cron(0 0 ? * 1 *)'
+      State: DISABLED
+      Targets:
+      - Arn: !GetAtt FunctionToAddS3BucketPolicy.Arn
+        Id: AddS3BucketPolicy
+
+  PermissionForEventToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FunctionToAddS3BucketPolicy
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'ScheduledRuleToAddS3BucketPolicy.Arn'
+
